@@ -12,6 +12,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Random;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class Main {
     public static final String BASE_URL = "http://localhost:8081";
@@ -27,12 +28,15 @@ public class Main {
 
 
     public static void main(String[] args) throws InterruptedException {
+        System.out.printf("Settings: concurrency=%d, warmupsec=%d, steadySec=%d, seed=%d\n",concurrency, warmupSeconds, steadySeconds, seed);
+
         double rate = concurrency / 9.0;
         Random random = new Random(seed);
         List<Long> arrivals = new ArrayList<>();
         double at = 0;
         while(at<warmupSeconds+steadySeconds){
             at += -Math.log(1 - random.nextDouble()) / rate;
+            if (at >= warmupSeconds + steadySeconds) break;
             arrivals.add((long)(at*1_000_000_000L));
         }
         System.out.println("seed=" + seed + " arrivals=" + arrivals.size());
@@ -40,31 +44,42 @@ public class Main {
         ExecutorService executor = Executors.newFixedThreadPool(8);
         HttpClient http = HttpClient.newBuilder().executor(executor)
                 .connectTimeout(Duration.ofSeconds(10)).build();
-        ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(2);
+        ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(6);
 
-        Listener l1 = new Listener("Player1", metrics, scheduler);
-        Listener l2 = new Listener("Player2", metrics, scheduler);
-
-        PlayerSession s1 = PlayerSession.builder()
-                .http(http)
-                .scheduler(scheduler)
-                .metrics(metrics)
-                .name("Player-1")
-                .listener(l1)
-                .build();
-        PlayerSession s2 = PlayerSession.builder()
-                .http(http)
-                .scheduler(scheduler)
-                .metrics(metrics)
-                .name("Player-2")
-                .listener(l2)
-                .build();
-
-        CompletableFuture.allOf(s1.start(), s2.start()).orTimeout(60, TimeUnit.SECONDS).join();
-
+        long start = System.nanoTime();
+        List<CompletableFuture<Void>> sessions = new CopyOnWriteArrayList<>();
+        AtomicInteger pairCounter = new AtomicInteger();
+        for(long offset : arrivals){
+            long intended = start + offset;
+            scheduler.schedule(() -> {
+                metrics.record("GENERATOR_LAG", System.nanoTime() - intended);
+                int n = pairCounter.incrementAndGet();
+                for(String suffix : List.of("a", "b")){
+                    String name = "P-"+n+"-"+suffix;
+                    PlayerSession session = PlayerSession.builder()
+                            .http(http)
+                            .scheduler(scheduler)
+                            .metrics(metrics)
+                            .name(name)
+                            .listener(new Listener(name, metrics, scheduler))
+                            .build();
+                    sessions.add(session.start());
+                }
+            }, intended - System.nanoTime(), TimeUnit.NANOSECONDS);
+        }
+        long endNanos = start + (warmupSeconds+steadySeconds)*1_000_000_000L;
+        long sleepMs = (endNanos - System.nanoTime()) / 1_000_000;
+        if(sleepMs>0) Thread.sleep(sleepMs);
+        try{
+            CompletableFuture.allOf(sessions.toArray(new CompletableFuture[0]))
+                    .orTimeout(60, TimeUnit.SECONDS)
+                    .join();
+        } catch (Exception e){
+            System.out.println("Some sessions failed or timed out; "+e);
+        }
         metrics.printMetrics();
-        System.out.println("Unanswered requests: Player1=" + l1.unanswered() + ", Player2=" + l2.unanswered()
-                + ", HTTP=" + httpTracker.unanswered());
+        System.out.println("Sessions started: " + sessions.size()
+                + ", HTTP unanswered=" + httpTracker.unanswered());
         executor.shutdown();
         scheduler.shutdown();
         System.exit(0);
