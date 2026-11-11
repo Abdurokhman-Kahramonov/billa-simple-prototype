@@ -8,7 +8,7 @@ import org.springframework.scheduling.annotation.EnableScheduling;
 @SpringBootApplication
 @ConfigurationPropertiesScan
 @EnableScheduling
-public class    LoadTestBillaApplication {
+public class LoadTestBillaApplication {
 	public static void main(String[] args) {
 		SpringApplication.run(LoadTestBillaApplication.class, args);
 	}

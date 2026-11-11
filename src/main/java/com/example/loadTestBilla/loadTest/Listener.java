@@ -23,11 +23,17 @@ public class Listener implements WebSocket.Listener {
     private volatile long lastRepIntended;
     private final List<ScheduledFuture<?>> reps = new CopyOnWriteArrayList<>();
 
-    public Listener(String label, Metrics metrics, ScheduledExecutorService scheduler) {
+    private final String baseUrl;
+    private volatile String matchId;
+    private volatile String opponentId;
+
+
+    public Listener(String label, Metrics metrics, ScheduledExecutorService scheduler, String baseUrl) {
         this.label = label;
         this.metrics = metrics;
         this.tracker = new RequestTracker(label, metrics);
         this.scheduler = scheduler;
+        this.baseUrl = baseUrl;
     }
 
     public void startQueueTimer() {
@@ -58,8 +64,13 @@ public class Listener implements WebSocket.Listener {
     private void handle(WebSocket ws, JsonNode frame) {
         String type = frame.path("type").asString();
         switch (type) {
-            case "READY_ACK", "REP_ACCEPTED", "REP_REJECTED", "PONG" ->
+            case "READY_ACK", "REP_REJECTED", "PONG" ->
                     tracker.received(frame.path("id").asInt(), type, frame.toString());
+            case "REP_ACCEPTED" ->{
+                tracker.received(frame.path("id").asInt(), type, frame.toString());
+                onRepAccepted(frame);
+            }
+            case "OPPONENT_REP" -> onOpponentRep(frame);
             case "MATCH_FOUND" -> { log(frame); onMatchFound(ws, frame); }
             case "MATCH_STARTED" -> { log(frame); onMatchStarted(ws, frame); }
             case "CONNECTED" -> {log(frame); playerId = frame.path("playerId").asString();}
@@ -68,6 +79,25 @@ public class Listener implements WebSocket.Listener {
             default -> log(frame);
         }
     }
+    private void recordLag(long nanos){
+        String kind = Main.matchServers.get(matchId).size() == 1 ? "SAME_SERVER" : "DIFFERENT_SERVER";
+        metrics.record("REPLICA_LAG: "+kind, nanos);
+    }
+    private void onOpponentRep(JsonNode frame){
+        String key = matchId + ":" + opponentId + ":" + frame.path("count").asInt();
+        long now = System.nanoTime();
+        Long iSaw = Main.repAcceptedAt.remove(key);
+        if(iSaw != null) recordLag(now - iSaw);
+        else Main.opponentRepAt.put(key, now);
+    }
+    private void onRepAccepted(JsonNode frame){
+        String key = matchId + ":" + playerId + ":" + frame.path("count").asInt();
+        long now = System.nanoTime();
+        Long opponentSaw = Main.opponentRepAt.remove(key);
+        if(opponentSaw != null) recordLag(opponentSaw - now);
+        else Main.repAcceptedAt.put(key, now);
+    }
+
     private void onMatchError(JsonNode frame){
         String code = frame.path("code").asString();
         metrics.count("error:"+code);
@@ -90,6 +120,11 @@ public class Listener implements WebSocket.Listener {
 
     }
     private void onMatchFound(WebSocket ws, JsonNode frame) {
+        matchId = frame.path("matchId").asString();
+        opponentId = frame.path("opponent").path("id").asString();
+        Main.matchServers.computeIfAbsent(matchId, k -> ConcurrentHashMap.newKeySet()).add(baseUrl);
+
+
         long started = queueStarted.get();
         matchFound = true;
         if (started != 0) {

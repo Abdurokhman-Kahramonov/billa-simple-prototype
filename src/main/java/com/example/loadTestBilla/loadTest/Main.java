@@ -3,34 +3,52 @@ package com.example.loadTestBilla.loadTest;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
 
+import java.io.BufferedWriter;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.lang.management.ManagementFactory;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.net.http.WebSocket;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.Duration;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Random;
+import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public class Main {
-    public static final String BASE_URL = "http://localhost:8081";
-    public static final String WS_BASE_URL = "ws://localhost:8081";
+
+    public static List<String> baseUrls = List.of(
+            System.getProperty("load.base-urls", "http://localhost:8081,http://localhost:8082").split(","));;
+
     public static final ObjectMapper JSON = new ObjectMapper();
     public static final Metrics metrics = new Metrics();
     private static final RequestTracker httpTracker = new RequestTracker("HTTP", metrics);
+
+    record Account(String id, String token) {}
+    static final Path ACCOUNTS_FILE = Path.of("target/load/accounts.csv");
+    static final ConcurrentLinkedQueue<Account> pool = new ConcurrentLinkedQueue<>();
+    static final ConcurrentHashMap<String, Set<String>> matchServers = new ConcurrentHashMap<>();
+    static final ConcurrentHashMap<String, Long> repAcceptedAt = new ConcurrentHashMap<>();
+    static final ConcurrentHashMap<String, Long> opponentRepAt = new ConcurrentHashMap<>();
+
+
 
     static int concurrency = Integer.getInteger("load.concurrency", 4);
     static int warmupSeconds = Integer.getInteger("load.warmup", 10);
     static int steadySeconds = Integer.getInteger("load.steady", 30);
     static long seed = Long.getLong("load.seed", 42L);
+    static Set<String> sessionList = ConcurrentHashMap.newKeySet();
 
 
-    public static void main(String[] args) throws InterruptedException {
+
+    public static void main(String[] args) throws InterruptedException, IOException {
         System.out.printf("Settings: concurrency=%d, warmupsec=%d, steadySec=%d, seed=%d\n",concurrency, warmupSeconds, steadySeconds, seed);
 
-        double rate = concurrency / 9.0;
+        double rate = concurrency / 9.0 /2;
         Random random = new Random(seed);
         List<Long> arrivals = new ArrayList<>();
         double at = 0;
@@ -41,32 +59,77 @@ public class Main {
         }
         System.out.println("seed=" + seed + " arrivals=" + arrivals.size());
 
+
+
+
         ExecutorService executor = Executors.newFixedThreadPool(8);
         HttpClient http = HttpClient.newBuilder().executor(executor)
                 .connectTimeout(Duration.ofSeconds(10)).build();
         ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(6);
 
+        int needed = 2 * concurrency;
+        List<Account> accounts = loadAccounts();
+        if(accounts.size() < needed || !tokenWorks(http, baseUrls.get(0), accounts.get(0).token())){
+            System.out.println("Provisioning " + needed + " accounts...");
+            accounts = provisionAccounts(http, needed);
+            saveAccount(accounts);
+        }
+        pool.addAll(accounts);
+        metrics.reset();
         long start = System.nanoTime();
         List<CompletableFuture<Void>> sessions = new CopyOnWriteArrayList<>();
         AtomicInteger pairCounter = new AtomicInteger();
+        AtomicInteger sessionCounter = new AtomicInteger();
+
+        var os = (com.sun.management.OperatingSystemMXBean) ManagementFactory.getOperatingSystemMXBean();
+
+
+        scheduler.scheduleAtFixedRate(() -> {
+            metrics.gauge("Active Sessions", sessionList.size());
+            metrics.gauge("GENERATOR_CPU_PERCENT", os.getProcessCpuLoad()*100);
+        }, 1,1, TimeUnit.SECONDS);
+        scheduler.schedule(metrics::reset, warmupSeconds, TimeUnit.SECONDS);
+
         for(long offset : arrivals){
             long intended = start + offset;
             scheduler.schedule(() -> {
                 metrics.record("GENERATOR_LAG", System.nanoTime() - intended);
                 int n = pairCounter.incrementAndGet();
-                for(String suffix : List.of("a", "b")){
-                    String name = "P-"+n+"-"+suffix;
+
+                Account a1 = pool.poll();
+                Account a2 = pool.poll();
+                if(a1 == null || a2 == null){
+                    if(a1!= null) pool.offer(a1);
+                    if (a2!= null) pool.offer(a2);
+                    metrics.count("error:pool-empty");
+                    return;
+                }
+
+                for(Account account : List.of(a1, a2)){
+                    String name = "P-" + n + (account == a1 ? "-a" : "-b");
+                    String baseUrl = baseUrls.get(sessionCounter.getAndIncrement()% baseUrls.size());
+                    System.out.println(name + " -> " + baseUrl);
                     PlayerSession session = PlayerSession.builder()
                             .http(http)
+                            .baseUrl(baseUrl)
                             .scheduler(scheduler)
                             .metrics(metrics)
                             .name(name)
-                            .listener(new Listener(name, metrics, scheduler))
+                            .token(account.token())
+                            .listener(new Listener(name, metrics, scheduler, baseUrl))
                             .build();
-                    sessions.add(session.start());
+                    CompletableFuture<Void> f = session.start();
+                    sessions.add(f);
+                    sessionList.add(session.getName());
+                    f.whenComplete((v, error) ->{
+                        sessionList.remove(session.getName());
+                        scheduler.schedule(()-> pool.offer(account), 1, TimeUnit.SECONDS);
+                    });
+
                 }
             }, intended - System.nanoTime(), TimeUnit.NANOSECONDS);
         }
+
         long endNanos = start + (warmupSeconds+steadySeconds)*1_000_000_000L;
         long sleepMs = (endNanos - System.nanoTime()) / 1_000_000;
         if(sleepMs>0) Thread.sleep(sleepMs);
@@ -85,17 +148,54 @@ public class Main {
         System.exit(0);
     }
 
-    static CompletableFuture<JsonNode> register(HttpClient http, String name) {
+    static List<Account> provisionAccounts(HttpClient http, int count){
+        Semaphore inFlight = new Semaphore(20);
+        List<CompletableFuture<Account>> futures = new ArrayList<>();
+        for(int i = 1; i<=count; i++){
+            inFlight.acquireUninterruptibly();
+            futures.add(register(http, baseUrls.get(0),"acc-"+i)
+                    .thenApply(r-> new Account(r.get("id").asString(), r.get("token").asString()))
+                    .whenComplete((a, error) -> inFlight.release()));
+        }
+        return futures.stream().map(CompletableFuture::join).toList();
+    }
+    static void saveAccount(List<Account> accounts) throws IOException {
+        Files.createDirectories(ACCOUNTS_FILE.getParent());
+        List<String> lines = new ArrayList<>();
+        lines.add("id,token");
+        for(Account a : accounts) lines.add(a.id() + "," + a.token());
+        Files.write(ACCOUNTS_FILE, lines);
+    }
+    static List<Account> loadAccounts() throws IOException {
+        if(!Files.exists(ACCOUNTS_FILE)) return List.of();
+        List<Account> result = new ArrayList<>();
+        for(String line: Files.readAllLines(ACCOUNTS_FILE).stream().skip(1).toList()){
+            String[] parts = line.split(",",2);
+            result.add(new Account(parts[0], parts[1]));
+        }
+        return result;
+    }
+    static boolean tokenWorks(HttpClient http, String baseUrl, String token){
+        HttpRequest request = HttpRequest.newBuilder(URI.create(baseUrl + "/api/players/me"))
+                .header("Authorization", "Bearer " + token)
+                .GET().build();
+        return http.sendAsync(request, HttpResponse.BodyHandlers.ofString())
+                .thenApply(r -> r.statusCode() == 200)
+                .exceptionally(error -> false)
+                .join();
+    }
+
+    static CompletableFuture<JsonNode> register(HttpClient http, String baseUrl, String name) {
         String body = "{\"name\":\"" + name + "\"}";
-        HttpRequest request = HttpRequest.newBuilder(URI.create(BASE_URL + "/api/players"))
+        HttpRequest request = HttpRequest.newBuilder(URI.create(baseUrl + "/api/players"))
                 .header("Content-Type", "application/json")
                 .POST(HttpRequest.BodyPublishers.ofString(body))
                 .build();
         return send(http, request, 201, "REGISTER", body);
     }
 
-    static CompletableFuture<JsonNode> joinQueue(HttpClient http, Listener listener, String token) {
-        HttpRequest request = HttpRequest.newBuilder(URI.create(BASE_URL + "/api/queue"))
+    static CompletableFuture<JsonNode> joinQueue(HttpClient http, String baseUrl, Listener listener, String token) {
+        HttpRequest request = HttpRequest.newBuilder(URI.create(baseUrl + "/api/queue"))
                 .header("Authorization", "Bearer " + token)
                 .POST(HttpRequest.BodyPublishers.noBody())
                 .build();
@@ -105,10 +205,11 @@ public class Main {
         });
     }
 
-    static CompletableFuture<WebSocket> connect(HttpClient http, Listener listener, String token) {
+    static CompletableFuture<WebSocket> connect(HttpClient http,String baseUrl, Listener listener, String token) {
+        String wsUrl = baseUrl.replaceFirst("^http", "ws");
         long start = System.nanoTime();
         return http.newWebSocketBuilder()
-                .buildAsync(URI.create(WS_BASE_URL + "/ws?token=" + token), listener)
+                .buildAsync(URI.create(wsUrl + "/ws?token=" + token), listener)
                 .whenComplete((ws, error) -> metrics.record("CONNECT", System.nanoTime() - start));
     }
 

@@ -22,16 +22,16 @@ public class PlayerSession {
     private final String name;
     private final Metrics metrics;
     private final ScheduledExecutorService scheduler;
+    private final String baseUrl;
 
     public CompletableFuture<Void> start(){
-        Main.register(http, name)
-                .thenCompose((reply)->{
-                    token = reply.get("token").asString();
-                    return Main.connect(http, listener, token);
-                })
+        CompletableFuture<Void> registered = (token!=null)?CompletableFuture.completedFuture(null)
+                : Main.register(http,baseUrl, name).thenAccept((reply)->token = reply.get("token").asString());
+        registered
+                .thenCompose((reply)-> Main.connect(http,baseUrl, listener, token))
                 .thenCompose(ws -> {
                     webSocket = ws;
-                    return Main.joinQueue(http, listener, token);
+                    return Main.joinQueue(http,baseUrl, listener, token);
                 })
                 .thenRun(() -> scheduler.schedule(this::checkMatchFound, 30, TimeUnit.SECONDS))
                 .exceptionally(error -> {

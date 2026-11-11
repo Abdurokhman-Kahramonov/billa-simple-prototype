@@ -12,7 +12,7 @@ import java.util.concurrent.atomic.LongAdder;
 public class Metrics {
     private final Map<String, List<Long>> samples = new ConcurrentHashMap<>();
     private final Map<String, LongAdder> counts = new ConcurrentHashMap<>();
-
+    private final Map<String, List<Double>> gauges = new ConcurrentHashMap<>();
     public void record(String signalName, long value){
         samples.computeIfAbsent(signalName, k -> Collections.synchronizedList(new ArrayList<>())).add(value);
     }
@@ -34,6 +34,11 @@ public class Metrics {
         for(String key: counts.keySet()){
             System.out.println(key + ": " + counts.get(key).sum());
         }
+        for(String name: gauges.keySet()){
+            List<Double> values = new ArrayList<>(gauges.get(name));
+            double max = Collections.max(values);
+            System.out.println(name + " ("+values.size()+" samples) max=" + max);
+        }
 
     }
     private static long percentile(List<Long> sorted, double p){
@@ -42,6 +47,15 @@ public class Metrics {
     }
     private static double ms(long nanos){
         return nanos / 1_000_000.0;
+    }
+
+    public void gauge(String name, double value){
+        gauges.computeIfAbsent(name, k ->Collections.synchronizedList(new ArrayList<>())).add(value);
+    }
+    public void reset(){
+        samples.clear();
+        counts.clear();
+        gauges.clear();
     }
 
 }
