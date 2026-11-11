@@ -79,7 +79,7 @@ public class Main {
         long start = System.nanoTime();
         List<CompletableFuture<Void>> sessions = new CopyOnWriteArrayList<>();
         AtomicInteger pairCounter = new AtomicInteger();
-        AtomicInteger sessionCounter = new AtomicInteger();
+        Random serverPicker = new Random(seed + 1);
 
         var os = (com.sun.management.OperatingSystemMXBean) ManagementFactory.getOperatingSystemMXBean();
 
@@ -104,10 +104,9 @@ public class Main {
                     metrics.count("error:pool-empty");
                     return;
                 }
-
                 for(Account account : List.of(a1, a2)){
                     String name = "P-" + n + (account == a1 ? "-a" : "-b");
-                    String baseUrl = baseUrls.get(sessionCounter.getAndIncrement()% baseUrls.size());
+                    String baseUrl = baseUrls.get(serverPicker.nextInt(baseUrls.size()));
                     System.out.println(name + " -> " + baseUrl);
                     PlayerSession session = PlayerSession.builder()
                             .http(http)

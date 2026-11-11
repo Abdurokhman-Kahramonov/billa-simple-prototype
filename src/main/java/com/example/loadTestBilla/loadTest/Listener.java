@@ -26,7 +26,7 @@ public class Listener implements WebSocket.Listener {
     private final String baseUrl;
     private volatile String matchId;
     private volatile String opponentId;
-
+    public final CompletableFuture<Void> connected = new CompletableFuture<>();
 
     public Listener(String label, Metrics metrics, ScheduledExecutorService scheduler, String baseUrl) {
         this.label = label;
@@ -63,6 +63,7 @@ public class Listener implements WebSocket.Listener {
 
     private void handle(WebSocket ws, JsonNode frame) {
         String type = frame.path("type").asString();
+
         switch (type) {
             case "READY_ACK", "REP_REJECTED", "PONG" ->
                     tracker.received(frame.path("id").asInt(), type, frame.toString());
@@ -73,7 +74,7 @@ public class Listener implements WebSocket.Listener {
             case "OPPONENT_REP" -> onOpponentRep(frame);
             case "MATCH_FOUND" -> { log(frame); onMatchFound(ws, frame); }
             case "MATCH_STARTED" -> { log(frame); onMatchStarted(ws, frame); }
-            case "CONNECTED" -> {log(frame); playerId = frame.path("playerId").asString();}
+            case "CONNECTED" -> {log(frame); playerId = frame.path("playerId").asString(); connected.complete(null);}
             case "MATCH_FINISHED" -> {log(frame); onMatchFinished(frame);}
             case "ERROR" -> {log(frame); onMatchError(frame);}
             default -> log(frame);

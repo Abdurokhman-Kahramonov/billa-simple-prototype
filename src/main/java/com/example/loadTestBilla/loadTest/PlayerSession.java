@@ -31,6 +31,9 @@ public class PlayerSession {
                 .thenCompose((reply)-> Main.connect(http,baseUrl, listener, token))
                 .thenCompose(ws -> {
                     webSocket = ws;
+                    return listener.connected.orTimeout(10, TimeUnit.SECONDS);
+                })
+                .thenCompose(ws -> {
                     return Main.joinQueue(http,baseUrl, listener, token);
                 })
                 .thenRun(() -> scheduler.schedule(this::checkMatchFound, 30, TimeUnit.SECONDS))
