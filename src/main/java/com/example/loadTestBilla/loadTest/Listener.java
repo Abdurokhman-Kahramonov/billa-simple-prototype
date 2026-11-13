@@ -22,7 +22,7 @@ public class Listener implements WebSocket.Listener {
     public volatile boolean matchFound;
     private volatile long lastRepIntended;
     private final List<ScheduledFuture<?>> reps = new CopyOnWriteArrayList<>();
-
+    private volatile int targetReps;
     private final String baseUrl;
     private volatile String matchId;
     private volatile String opponentId;
@@ -85,6 +85,9 @@ public class Listener implements WebSocket.Listener {
         metrics.record("REPLICA_LAG: "+kind, nanos);
     }
     private void onOpponentRep(JsonNode frame){
+        if(frame.path("count").asInt() >= targetReps){
+            reps.forEach(f->f.cancel(false));
+        }
         String key = matchId + ":" + opponentId + ":" + frame.path("count").asInt();
         long now = System.nanoTime();
         Long iSaw = Main.repAcceptedAt.remove(key);
@@ -137,7 +140,8 @@ public class Listener implements WebSocket.Listener {
 
     private void onMatchStarted(WebSocket ws, JsonNode frame) {
         metrics.record("READY_TO_STARTED", System.nanoTime() - readySent.get());
-        int target = frame.path("target").asInt();
+        targetReps = frame.path("target").asInt();
+        int target = targetReps;
         String matchId = frame.path("matchId").asString();
         long start = System.nanoTime();
         long offset = 0;

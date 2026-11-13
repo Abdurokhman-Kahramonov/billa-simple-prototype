@@ -45,17 +45,52 @@ public class Metrics {
         int position = (int) Math.ceil(p / 100.0 * sorted.size());
         return sorted.get(Math.max(1, position) - 1);
     }
+    public double percentileMs(String signal, double p){
+        List<Long> list = samples.get(signal);
+        if(list == null || list.isEmpty()) return Double.NaN;
+        List<Long> sorted = new ArrayList<>(list);
+        Collections.sort(sorted);
+        return ms(percentile(sorted, p));
+    }
+    public long countOf(String key){
+        LongAdder a = counts.get(key);
+        return a == null ? 0 : a.sum();
+    }
+    public Map<String, Long> countsStartingWith(String prefix){
+        Map<String, Long> found = new HashMap<>();
+        counts.forEach((k,v)->{
+            if (k.startsWith(prefix)) found.put(k, v.sum());
+        });
+        return found;
+    }
     private static double ms(long nanos){
         return nanos / 1_000_000.0;
     }
+    public double gaugeMean(String name){
+        List<Double> copy = new ArrayList<>(gauges.getOrDefault(name, List.of()));
+        if(copy.isEmpty()) return Double.NaN;
+        double sum = 0;
+        for(double v:copy) sum+=v;
+        return sum/copy.size();
+    }
+    public double gaugePercentile(String name, double p){
+        List<Double> sorted = new ArrayList<>(gauges.getOrDefault(name, List.of()));
+        if(sorted.isEmpty()) return Double.NaN;
+        Collections.sort(sorted);
+        return sorted.get(Math.max(1, (int) Math.ceil(p / 100.0 * sorted.size())) - 1);
 
+    }
+    public List<String> gaugeNamesEndingWith(String suffix){
+        return gauges.keySet().stream().filter(k -> k.endsWith(suffix)).toList();
+    }
     public void gauge(String name, double value){
         gauges.computeIfAbsent(name, k ->Collections.synchronizedList(new ArrayList<>())).add(value);
     }
-    public void reset(){
+    public void reset() {
         samples.clear();
-        counts.clear();
         gauges.clear();
+        counts.keySet().removeIf(k -> !(k.startsWith("error:") || k.startsWith("timeout:")));
     }
+
 
 }

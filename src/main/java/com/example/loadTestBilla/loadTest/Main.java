@@ -36,10 +36,10 @@ public class Main {
     static final ConcurrentHashMap<String, Long> opponentRepAt = new ConcurrentHashMap<>();
 
 
-
-    static int concurrency = Integer.getInteger("load.concurrency", 4);
-    static int warmupSeconds = Integer.getInteger("load.warmup", 10);
-    static int steadySeconds = Integer.getInteger("load.steady", 30);
+    static volatile boolean measuring = true;
+    static int concurrency = Integer.getInteger("load.concurrency", 20);
+    static int warmupSeconds = Integer.getInteger("load.warmup", 40);
+    static int steadySeconds = Integer.getInteger("load.steady", 60);
     static long seed = Long.getLong("load.seed", 42L);
     static Set<String> sessionList = ConcurrentHashMap.newKeySet();
 
@@ -67,6 +67,10 @@ public class Main {
                 .connectTimeout(Duration.ofSeconds(10)).build();
         ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(6);
 
+        ServerScraper scraper = new ServerScraper(http, baseUrls, metrics);
+        scheduler.scheduleAtFixedRate(scraper::scrapeOnce, 1, 1, TimeUnit.SECONDS);
+
+
         int needed = 2 * concurrency;
         List<Account> accounts = loadAccounts();
         if(accounts.size() < needed || !tokenWorks(http, baseUrls.get(0), accounts.get(0).token())){
@@ -83,12 +87,17 @@ public class Main {
 
         var os = (com.sun.management.OperatingSystemMXBean) ManagementFactory.getOperatingSystemMXBean();
 
+        scheduler.scheduleAtFixedRate(()->{
+           if(!measuring) return;
+           metrics.gauge("Active Sessions", sessionList.size());
+           metrics.gauge("GENERATOR_CPU_PERCENT", os.getProcessCpuLoad()*100);
+        }, 1 , 1, TimeUnit.SECONDS);
 
-        scheduler.scheduleAtFixedRate(() -> {
-            metrics.gauge("Active Sessions", sessionList.size());
-            metrics.gauge("GENERATOR_CPU_PERCENT", os.getProcessCpuLoad()*100);
-        }, 1,1, TimeUnit.SECONDS);
-        scheduler.schedule(metrics::reset, warmupSeconds, TimeUnit.SECONDS);
+        scheduler.schedule(()-> {
+                    metrics.reset();
+                    scraper.resetCounters();
+                }
+            , warmupSeconds, TimeUnit.SECONDS);
 
         for(long offset : arrivals){
             long intended = start + offset;
@@ -132,16 +141,16 @@ public class Main {
         long endNanos = start + (warmupSeconds+steadySeconds)*1_000_000_000L;
         long sleepMs = (endNanos - System.nanoTime()) / 1_000_000;
         if(sleepMs>0) Thread.sleep(sleepMs);
+        measuring = false;
         try{
             CompletableFuture.allOf(sessions.toArray(new CompletableFuture[0]))
                     .orTimeout(60, TimeUnit.SECONDS)
                     .join();
         } catch (Exception e){
+            System.out.println("Unfinished sessions: " + sessions.stream().filter(f -> !f.isDone()).count());
             System.out.println("Some sessions failed or timed out; "+e);
         }
-        metrics.printMetrics();
-        System.out.println("Sessions started: " + sessions.size()
-                + ", HTTP unanswered=" + httpTracker.unanswered());
+        writeReport(scraper, sessions.size());
         executor.shutdown();
         scheduler.shutdown();
         System.exit(0);
@@ -221,4 +230,27 @@ public class Main {
             return JSON.readTree(response.body());
         });
     }
+    static void writeReport(ServerScraper scraper, int sessionsStarted) throws IOException {
+        var buffer = new java.io.ByteArrayOutputStream();
+        var original = System.out;
+        System.setOut(new java.io.PrintStream(buffer, true, java.nio.charset.StandardCharsets.UTF_8));
+        try {
+            System.out.println("# Load test: " + concurrency + " players");
+            System.out.println("seed=" + seed + ", warmup=" + warmupSeconds + "s, steady=" + steadySeconds + "s");
+            System.out.println("servers=" + baseUrls);
+            System.out.println("Sessions started: " + sessionsStarted + ", HTTP unanswered=" + httpTracker.unanswered());
+            metrics.printMetrics();
+            scraper.printCounterDeltas();
+            System.out.println("VERDICT: " + Verdict.evaluate(metrics, scraper, concurrency));
+        } finally {
+            System.setOut(original);
+        }
+        String text = buffer.toString(java.nio.charset.StandardCharsets.UTF_8);
+        Path file = Path.of("target/load/players-" + concurrency + ".md");
+        Files.createDirectories(file.getParent());
+        Files.writeString(file, text);
+        System.out.println(text);
+        System.out.println("Report written to " + file);
+    }
+
 }

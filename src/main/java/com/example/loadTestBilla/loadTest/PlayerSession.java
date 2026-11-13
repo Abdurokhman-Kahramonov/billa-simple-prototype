@@ -39,6 +39,7 @@ public class PlayerSession {
                 .thenRun(() -> scheduler.schedule(this::checkMatchFound, 30, TimeUnit.SECONDS))
                 .exceptionally(error -> {
                     metrics.count("error:session-start");
+                    System.err.println(name + " failed to start: " + error);
                     listener.done.completeExceptionally(error);
                     return null;
                 });
