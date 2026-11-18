@@ -37,7 +37,7 @@ public class Main {
 
 
     static volatile boolean measuring = true;
-    static int concurrency = Integer.getInteger("load.concurrency", 20);
+    static int concurrency = Integer.getInteger("load.concurrency", 1300);
     static int warmupSeconds = Integer.getInteger("load.warmup", 40);
     static int steadySeconds = Integer.getInteger("load.steady", 60);
     static long seed = Long.getLong("load.seed", 42L);
@@ -58,8 +58,6 @@ public class Main {
             arrivals.add((long)(at*1_000_000_000L));
         }
         System.out.println("seed=" + seed + " arrivals=" + arrivals.size());
-
-
 
 
         ExecutorService executor = Executors.newFixedThreadPool(8);
@@ -147,7 +145,9 @@ public class Main {
                     .orTimeout(60, TimeUnit.SECONDS)
                     .join();
         } catch (Exception e){
-            System.out.println("Unfinished sessions: " + sessions.stream().filter(f -> !f.isDone()).count());
+            long unfinished = sessions.stream().filter(f -> !f.isDone()).count();
+            for (long i = 0; i < unfinished; i++) metrics.count("timeout:unfinished-session");
+            System.out.println("Unfinished sessions: " + unfinished);
             System.out.println("Some sessions failed or timed out; "+e);
         }
         writeReport(scraper, sessions.size());

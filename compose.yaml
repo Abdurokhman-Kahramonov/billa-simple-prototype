@@ -1,4 +1,34 @@
 services:
+  app-a:
+    build: .
+    profiles: ["servers"]
+    ports: ["8081:8081"]
+    cpus: 2
+    mem_limit: 4g
+    environment:
+      SERVER_PORT: 8081
+      GAME_INSTANCE_ID: a
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/mydatabase
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: 6379
+      SPRING_DOCKER_COMPOSE_ENABLED: "false"
+      JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=60 -Dtrace=false"
+    depends_on: [postgres, redis]
+  app-b:
+    build: .
+    profiles: [ "servers" ]
+    ports: [ "8082:8082" ]
+    cpus: 2
+    mem_limit: 4g
+    environment:
+      SERVER_PORT: 8082
+      GAME_INSTANCE_ID: b
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/mydatabase
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: 6379
+      SPRING_DOCKER_COMPOSE_ENABLED: "false"
+      JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=60 -Dtrace=false"
+    depends_on: [ postgres, redis ]
   postgres:
     image: 'postgres:17'
     environment:

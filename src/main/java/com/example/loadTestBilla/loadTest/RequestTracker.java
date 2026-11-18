@@ -43,14 +43,15 @@ public class RequestTracker {
         metrics.count("frame:" + replyType);
         print(id, p.type(), p.request(), replyType + " after " + ms(took) + " ms, " + replyBody);
     }
-    public void failed(int id, String code, String replyBody){
+    public String failed(int id, String code, String replyBody){
         Pending p = pending.remove(id);
         if(p == null){
             metrics.count("harness:unknown-reply-id");
-            return;
+            return null;
         }
         long took = System.nanoTime() - p.sentAtNanos();
         print(id, p.type(), p.request(), "ERROR "+code+" after "+ ms(took)+" ms, "+ replyBody);
+        return p.type();
     }
     public CompletableFuture<HttpResponse<String>> sendHttp(HttpClient client, HttpRequest request,
                                                             String signal, String requestBody) {

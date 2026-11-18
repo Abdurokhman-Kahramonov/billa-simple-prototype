@@ -6,6 +6,8 @@ import java.net.http.WebSocket;
 import java.util.List;
 import java.util.Random;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 public class Listener implements WebSocket.Listener {
@@ -27,6 +29,9 @@ public class Listener implements WebSocket.Listener {
     private volatile String matchId;
     private volatile String opponentId;
     public final CompletableFuture<Void> connected = new CompletableFuture<>();
+    private final AtomicInteger acceptedReps = new AtomicInteger();
+    private final AtomicBoolean finished = new AtomicBoolean();
+
 
     public Listener(String label, Metrics metrics, ScheduledExecutorService scheduler, String baseUrl) {
         this.label = label;
@@ -65,8 +70,12 @@ public class Listener implements WebSocket.Listener {
         String type = frame.path("type").asString();
 
         switch (type) {
-            case "READY_ACK", "REP_REJECTED", "PONG" ->
+            case "READY_ACK", "PONG" ->
                     tracker.received(frame.path("id").asInt(), type, frame.toString());
+            case "REP_REJECTED" -> {
+                tracker.received(frame.path("id").asInt(), type, frame.toString());
+                onRepRejected(ws, frame);
+            }
             case "REP_ACCEPTED" ->{
                 tracker.received(frame.path("id").asInt(), type, frame.toString());
                 onRepAccepted(frame);
@@ -80,6 +89,13 @@ public class Listener implements WebSocket.Listener {
             default -> log(frame);
         }
     }
+    private void onRepRejected(WebSocket ws, JsonNode frame){
+        if(!"too-fast".equals(frame.path("reason").asString())) return;
+        if(finished.get() || acceptedReps.get() >= targetReps) return;
+        reps.add(scheduler.schedule(
+                () -> tracker.sendFrame(ws, "REP", matchId), 350, TimeUnit.MILLISECONDS));
+    }
+
     private void recordLag(long nanos){
         String kind = Main.matchServers.get(matchId).size() == 1 ? "SAME_SERVER" : "DIFFERENT_SERVER";
         metrics.record("REPLICA_LAG: "+kind, nanos);
@@ -95,6 +111,7 @@ public class Listener implements WebSocket.Listener {
         else Main.opponentRepAt.put(key, now);
     }
     private void onRepAccepted(JsonNode frame){
+        acceptedReps.incrementAndGet();
         String key = matchId + ":" + playerId + ":" + frame.path("count").asInt();
         long now = System.nanoTime();
         Long opponentSaw = Main.opponentRepAt.remove(key);
@@ -104,16 +121,34 @@ public class Listener implements WebSocket.Listener {
 
     private void onMatchError(JsonNode frame){
         String code = frame.path("code").asString();
-        metrics.count("error:"+code);
-        if(frame.has("id")){
-            tracker.failed(frame.path("id").asInt(), code, frame.toString());
+        String type = frame.has("id")
+                ? tracker.failed(frame.path("id").asInt(), code, frame.toString())
+                : null;
+        if ("not-in-match".equals(code) && "REP".equals(type)) {
+            if (finished.get()) {
+                metrics.count("late-rep");
+            } else {
+                scheduler.schedule(() ->
+                                metrics.count(finished.get() ? "late-rep" : "error:not-in-match"),
+                        2, TimeUnit.SECONDS);
+            }
+            return;
         }
+        metrics.count("error:" + code);
     }
+
 
     private void log(JsonNode frame) {
         System.out.println(label + " <- " + frame + "\n");
     }
     private void onMatchFinished(JsonNode frame){
+        if(!finished.compareAndSet(false, true)){
+            metrics.count("error:match-finished-twice");
+            return;
+        }
+        if(frame.path("yourReps").asInt() != acceptedReps.get()){
+            metrics.count("error:match-finished-mismatch");
+        }
         reps.forEach(f -> f.cancel(false));
         boolean iWon = "TARGET_REACHED".equals(frame.path("reason").asString())
                 && playerId != null && playerId.equals(frame.path("winnerId").asString());
